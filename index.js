@@ -2530,25 +2530,6 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
   }
 }
 
-// Safari suspends the extension's worker now and then, and the bridge sees it gone for a few
-// seconds (in proxy mode, until the next 10 s primary check). A safari_new_tab in that gap went
-// to AppleScript: the tab came back with no receipt, and once the extension was back it refused
-// that tab as "not opened by this MCP session" (seen 24.10.26). A session the extension served a
-// moment ago waits for it first; one that never had it, or lost it long ago, falls back at once.
-const EXTENSION_BLIP_WINDOW_MS = 120000;
-const EXTENSION_BLIP_WAIT_MS = 10500;
-let _extensionLastUsedAt = 0;
-async function _waitForExtensionBlip(timeoutMs = EXTENSION_BLIP_WAIT_MS) {
-  if (_extensionConnected) return true;
-  if (!_extensionLastUsedAt || Date.now() - _extensionLastUsedAt > EXTENSION_BLIP_WINDOW_MS) return false;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    if (_extensionConnected) return true;
-  }
-  return false;
-}
-
 // Try the profile-verified extension first. Named profiles are extension-only:
 // crossing to AppleScript would lose the extension's profile and tab-id proof.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
@@ -2567,13 +2548,23 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   if (_preferAppleScript && (!_extensionConnected || !_profileExtensionVerified)) {
     await _waitForVerifiedProfileExtension(30000);
   }
-  // A tab opened through AppleScript has no receipt, so a new_tab rides out a short drop-out.
-  if (!_preferAppleScript && extensionType === "new_tab" && !_extensionConnected) await _waitForExtensionBlip();
+  // Without a named profile a new tab gets a shorter grace. Safari suspends the worker now
+  // and then, and an AppleScript tab opened in that gap has no receipt, which the extension
+  // refuses once it is back. So when the extension served this daemon in the last two minutes,
+  // wait up to ~10 s (one proxy primary check) for it; a daemon that never had it, or lost it
+  // long ago, falls back at once. The timestamp lives on this function so the guard stays
+  // self-contained. Idea and diagnosis from PR #190 by @kad-xyz.
+  if (!_preferAppleScript && extensionType === "new_tab" && !_extensionConnected &&
+      Date.now() - (extensionOrFallback.servedAt || 0) < 120000) {
+    const deadline = Date.now() + 10500;
+    while (!_extensionConnected && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
   // Save the frontmost app before the operation and restore it after if Safari stole focus.
   // Set focusGuard flag so inner osascript/runJSLarge calls skip their own focus logic.
+  const opStart = Date.now();
   const savedApp = _preferAppleScript ? null : await safari.saveFrontmostApp();
   safari.setFocusGuard(true);
 
@@ -2670,7 +2661,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
-    if (usedExtension) _extensionLastUsedAt = Date.now();
+    if (usedExtension) extensionOrFallback.servedAt = Date.now();
     if (!usedExtension) {
       if (_preferAppleScript) {
         // The extension answered here, so naming it unavailable sent callers after a bridge
@@ -2712,7 +2703,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     // then yanks Safari out from under them (the "VS Code jumps in front while I work
     // in Safari" bug), and the HID-idle guard can't catch it because a user who is
     // reading (not typing) looks idle. So skip restore entirely for extension ops.
-    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp);
+    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp, opStart);
   }
 
   return result;
@@ -3424,19 +3415,7 @@ server.tool(
     if (typeof rawResult === 'string') {
       try { result = JSON.parse(rawResult); } catch {}
     }
-    let safeResult = _sanitizeTabResult(result);
-    // A tab AppleScript opened has no receipt, and nothing in the result said so: the caller only
-    // learned it from the next refusal.
-    if (viaAppleScript && safeResult && typeof safeResult === "object") {
-      safeResult = {
-        ...safeResult,
-        receipt: null,
-        via: "applescript",
-        note: "The Safari extension was not connected, so AppleScript opened this tab: it has no receipt, " +
-          "and once the extension is back it will not accept this tab by index. Keep working in it without " +
-          "a receipt, or open a new tab with safari_new_tab when safari_doctor shows the extension connected.",
-      };
-    }
+    const safeResult = _sanitizeTabResult(result);
     // Sync safari.js tracking when extension handled new_tab. The raw navigation URL
     // remains internal and is never copied into the MCP response.
     if (safeResult?.tabIndex) {
@@ -3457,9 +3436,20 @@ server.tool(
     if (!viaAppleScript) safari.setActiveTabFromExtension(safeResult?.tabIndex, requestedUrl);
     // The eviction used to be stderr-only, so a session learned about its closed tab from
     // the next "receipt … stale" error. Say it in the response instead.
-    const out = evicted && safeResult && typeof safeResult === "object"
+    let out = evicted && safeResult && typeof safeResult === "object"
       ? { ...safeResult, ..._evictionReport(evicted) }
       : safeResult;
+    // Nothing in an AppleScript tab's result said it had no receipt; the caller learned it
+    // from the next refusal.
+    if (viaAppleScript && out && typeof out === "object" && !out.receipt) {
+      out = {
+        ...out,
+        receipt: null,
+        via: "applescript",
+        note: "The Safari extension was not connected, so AppleScript opened this tab without a receipt. " +
+          "Keep working in it without one, or open a new tab once safari_doctor shows the extension connected.",
+      };
+    }
     return { content: [{ type: "text", text: typeof out === 'string' ? out : JSON.stringify(out) }] };
   }
 );

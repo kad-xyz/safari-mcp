@@ -123,47 +123,34 @@ test("CLICK: an unclaimed anchor still navigates (the fix must not break plain l
   );
 });
 
-// A consent checkbox whose label wraps a policy link (Google Cloud's OAuth consent screen):
-// the label's centre, and the point a hidden Material checkbox resolves to, is the link.
-const CONSENT_HTML =
-  `<label id="label"><input type="checkbox" id="cb"> I agree to the ` +
-  `<a href="/policy" data-leaf>User Data Policy</a></label>`;
+// A checkbox whose label wraps a link (a consent line with a policy link): the label's
+// centre is the link, so resolving the checkbox through the probe points must not land there.
+const CONSENT_LABEL =
+  `<label id="consent"><input type="checkbox" id="agree"> I accept the ` +
+  `<a href="/terms" data-leaf>terms</a></label>`;
 
-test("CLICK: a checkbox whose label wraps a link toggles instead of following the link", () => {
-  const { window, navAttempts } = domWithHelpers(CONSENT_HTML);
-  const cb = window.document.getElementById("cb");
-
-  window.mcpClick(cb);
-
-  assert.deepEqual(navAttempts, [], "clicking the checkbox must not follow the link in its label");
-  assert.equal(cb.checked, true, "the checkbox must be checked");
+test("CLICK: a checkbox inside a label that wraps a link is checked, and the link is not followed", () => {
+  const { window, navAttempts } = domWithHelpers(CONSENT_LABEL);
+  const box = window.document.getElementById("agree");
+  assert.equal(window.mcpResolveTarget(box), box, "the checkbox stays the target");
+  window.mcpClick(box);
+  assert.deepEqual(navAttempts, [], "the link in the label must not be followed");
+  assert.equal(box.checked, true);
 });
 
-test("CLICK: clicking such a label activates its checkbox, not the link inside it", () => {
-  const { window, navAttempts } = domWithHelpers(CONSENT_HTML);
-  const cb = window.document.getElementById("cb");
-
-  window.mcpClick(window.document.getElementById("label"));
-
-  assert.deepEqual(navAttempts, [], "clicking the label must not follow the link inside it");
-  assert.equal(cb.checked, true, "the label's checkbox must be checked");
+test("CLICK: clicking that label checks its checkbox without following the link", () => {
+  const { window, navAttempts } = domWithHelpers(CONSENT_LABEL);
+  window.mcpClick(window.document.getElementById("consent"));
+  assert.deepEqual(navAttempts, []);
+  assert.equal(window.document.getElementById("agree").checked, true);
 });
 
-test("CLICK: resolving a checkbox never lands on the link in its label", () => {
-  const { window } = domWithHelpers(CONSENT_HTML);
-  const cb = window.document.getElementById("cb");
-
-  assert.equal(window.mcpResolveTarget(cb), cb);
-});
-
-test("CLICK: a plain checkbox is toggled exactly once", () => {
-  const { window } = domWithHelpers(`<input type="checkbox" id="cb" data-leaf>`);
-  const cb = window.document.getElementById("cb");
+test("CLICK: a bare checkbox toggles once and its click handler runs once", () => {
+  const { window } = domWithHelpers(`<input type="checkbox" id="box" data-leaf>`);
+  const box = window.document.getElementById("box");
   let clicks = 0;
-  cb.addEventListener("click", () => clicks++);
-
-  window.mcpClick(cb);
-
-  assert.equal(cb.checked, true, "the checkbox must end up checked, not toggled twice back to unchecked");
-  assert.equal(clicks, 1, "the checkbox's click handlers must run once");
+  box.addEventListener("click", () => clicks++);
+  window.mcpClick(box);
+  assert.equal(box.checked, true, "two toggles would leave it unchecked");
+  assert.equal(clicks, 1);
 });
